@@ -35,11 +35,50 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Herdi")
-            button.image?.size = NSSize(width: 14, height: 14)
-        }
+        applyStatusIcon(blocked: false)
         rebuildMenu()
+    }
+
+    /// The status glyph stays a circle in every state, because that is how you find Herdi in a
+    /// row of menu bar icons. Muted and presenting vary the circle -- slashed, dashed -- rather
+    /// than swapping in a speaker or an eye, which read as some other app entirely.
+    private func applyStatusIcon(blocked: Bool) {
+        guard let button = statusItem?.button else { return }
+
+        let symbol: String
+        let label: String
+        let tint: NSColor?
+        let size: CGFloat
+
+        if blocked {
+            symbol = "exclamationmark.circle.fill"
+            label = "Herdi: agent blocked"
+            tint = .systemRed
+            size = 16
+        } else if Quiet.presentationMode {
+            symbol = "circle.dashed"
+            label = "Herdi: presentation mode"
+            // nil, not a grey: a fixed colour overrides the menu bar's template rendering and
+            // paints dark-on-dark. The dashed ring is the signal; the colour stays the default.
+            tint = nil
+            size = 14
+        } else if !Quiet.soundEnabled {
+            symbol = relay.isConnected ? "circle.slash.fill" : "circle.slash"
+            label = "Herdi: sound off"
+            tint = nil
+            size = 14
+        } else {
+            symbol = relay.isConnected ? "circle.fill" : "circle"
+            label = relay.isConnected ? "Herdi: connected" : "Herdi: disconnected"
+            tint = nil
+            size = 14
+        }
+
+        // A missing symbol would leave the menu bar item invisible, so never ship without one.
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+            ?? NSImage(systemSymbolName: "circle.fill", accessibilityDescription: label)
+        button.image?.size = NSSize(width: size, height: size)
+        button.contentTintColor = tint
     }
 
     private func rebuildMenu() {
@@ -93,6 +132,38 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // Interruptions
+        let soundItem = NSMenuItem(title: "Sound", action: #selector(toggleSound), keyEquivalent: "")
+        soundItem.target = self
+        soundItem.state = Quiet.soundEnabled ? .on : .off
+        soundItem.image = NSImage(
+            systemSymbolName: Quiet.soundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
+            accessibilityDescription: Quiet.soundEnabled ? "Sound on" : "Sound off"
+        )
+        menu.addItem(soundItem)
+
+        let testItem = NSMenuItem(title: "Test Notification", action: #selector(sendTestNotification), keyEquivalent: "")
+        testItem.target = self
+        testItem.image = NSImage(systemSymbolName: "bell.badge", accessibilityDescription: nil)
+        menu.addItem(testItem)
+
+        let presentItem = NSMenuItem(title: "Presentation Mode", action: #selector(togglePresentationMode), keyEquivalent: "p")
+        presentItem.target = self
+        presentItem.state = Quiet.presentationMode ? .on : .off
+        presentItem.image = NSImage(
+            systemSymbolName: Quiet.presentationMode ? "eye.slash.fill" : "eye",
+            accessibilityDescription: nil
+        )
+        menu.addItem(presentItem)
+
+        if Quiet.presentationMode {
+            let paused = NSMenuItem(title: "Panel stays closed until you open it", action: nil, keyEquivalent: "")
+            paused.isEnabled = false
+            menu.addItem(paused)
+        }
+
+        menu.addItem(.separator())
+
         // Launch at login
         let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchItem.target = self
@@ -130,6 +201,26 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    @objc private func sendTestNotification() {
+        relay.sendTestNotification()
+    }
+
+    @objc private func toggleSound() {
+        Quiet.soundEnabled.toggle()
+        refreshChrome()
+    }
+
+    @objc private func togglePresentationMode() {
+        Quiet.presentationMode.toggle()
+        refreshChrome()
+    }
+
+    /// Repaint immediately rather than waiting up to a second for the next poll.
+    private func refreshChrome() {
+        applyStatusIcon(blocked: relay.agents.contains { $0.status == .blocked })
+        rebuildMenu()
+    }
+
     @objc private func toggleLaunchAtLogin() {
         let current = UserDefaults.standard.bool(forKey: "launchAtLogin")
         let newValue = !current
@@ -164,18 +255,7 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 let blocked = self.relay.agents.filter { $0.status == .blocked }
 
-                // Update status item icon
-                if let button = self.statusItem?.button {
-                    if !blocked.isEmpty {
-                        button.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Blocked")
-                        button.image?.size = NSSize(width: 16, height: 16)
-                        button.contentTintColor = .systemRed
-                    } else {
-                        button.image = NSImage(systemSymbolName: self.relay.isConnected ? "circle.fill" : "circle", accessibilityDescription: "Herdi")
-                        button.image?.size = NSSize(width: 14, height: 14)
-                        button.contentTintColor = nil
-                    }
-                }
+                self.applyStatusIcon(blocked: !blocked.isEmpty)
 
                 if let controller = self.panelController {
                     let blockedIds = Set(blocked.map(\.id))
@@ -201,7 +281,7 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
                     controller.dismissedBlocked.formIntersection(blockedIds)
 
                     // Auto-pop for a blocked agent you have not already waved away.
-                    if controller.surface == .collapsed,
+                    if controller.surface == .collapsed, Quiet.shouldAutoExpand,
                        let agent = blocked.first(where: { !controller.dismissedBlocked.contains($0.id) }) {
                         withAnimation(NotchAnimation.pop) {
                             controller.surface = .approval(agentId: agent.id)
