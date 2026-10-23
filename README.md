@@ -131,6 +131,17 @@ The `/start`, `/read`, `/reply`, `/send`, `/interrupt`, and `/trust` pickers kee
 
 Finished and blocked notifications include **Open output & reply**. You can also reply directly to the notification to send a follow-up without returning to the agent list. Blocked notifications retain their one-tap approval controls.
 
+## Conversation history
+
+The web terminal's **History** panel reads Claude, Codex, Pi and Kimi transcripts.
+Codex history is located by session UUID under `$CODEX_HOME/sessions` (default
+`~/.codex/sessions`), including dated `YYYY/MM/DD/rollout-*.jsonl` files.
+Set `HERDR_CODEX_ROOTS` to override the local session roots (comma-separated).
+For Codex panes on an SSH host, set `HERDR_REMOTE_CODEX_ROOTS` when the remote
+sessions are not under `$HOME/.codex/sessions`; the relay's local `CODEX_HOME`
+is not used on the remote host. Only Claude and Codex currently support SSH
+transcript reads. `HERDR_TRANSCRIPT=0` disables history for every agent.
+
 ## Architecture
 
 ```

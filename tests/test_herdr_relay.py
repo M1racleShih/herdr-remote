@@ -2638,6 +2638,49 @@ class RelayPaneFieldTests(unittest.TestCase):
         self.assertEqual(payload["total"], 2)
         self.assertFalse(payload["has_more"])
 
+    def test_get_history_reads_codex_rollouts_locally_and_over_ssh(self):
+        pane_id = "w0:p1"
+        session_id = "1b3d9f8a-2c4e-4a6b-8d0f-112233445566"
+        rows = [{"type": "response_item", "timestamp": "2026-10-23T12:00:00Z",
+                 "payload": {"type": "message", "role": role,
+                             "content": [{"type": kind, "text": text}]}}
+                for role, kind, text in (("user", "input_text", "does this work?"),
+                                         ("assistant", "output_text", "it does"))]
+        blob = ("\n".join(json.dumps(row) for row in rows) + "\n").encode()
+        frame = f"SIZE {len(blob)}\n".encode() + blob
+        for remote in (None, "build-box"):
+            with self.subTest(remote=remote), loaded_relay() as relay, \
+                 tempfile.TemporaryDirectory() as root:
+                directory = Path(root) / "2026" / "10" / "23"
+                directory.mkdir(parents=True)
+                (directory / f"rollout-2026-10-23T12-00-00-{session_id}.jsonl").write_bytes(blob)
+                relay.transcript.cache_clear()
+                relay.known_panes.add(pane_id)
+                relay.agent_cache[pane_id] = {"pane_id": pane_id, "agent": "codex"}
+                relay.pane_session_map[pane_id] = {
+                    "agent": "codex", "kind": "id", "value": session_id}
+                if remote:
+                    relay.pane_remote_map[pane_id] = remote
+                ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": pane_id})])
+                completed = subprocess.CompletedProcess([], 0, stdout=frame, stderr=b"")
+                with mock.patch.object(relay.transcript, "CODEX_ROOTS", [root]), \
+                     mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                     mock.patch.object(relay, "run_herdr") as herdr, \
+                     mock.patch.object(relay.subprocess, "run", return_value=completed) as ssh:
+                    asyncio.run(relay.handle_client(ws))
+                herdr.assert_not_called()
+                payload = json.loads(ws.sent[0])
+                self.assertEqual((payload["type"], payload["agent"], payload["unavailable"]),
+                                 ("history", "codex", None))
+                self.assertEqual([(m["role"], m["text"]) for m in payload["messages"]],
+                                 [("user", "does this work?"), ("assistant", "it does")])
+                if remote:
+                    ssh.assert_called_once()
+                    self.assertIn(f"rollout-*-{session_id}.jsonl", ssh.call_args.args[0][-1])
+                    self.assertNotIn(".claude", ssh.call_args.args[0][-1])
+                else:
+                    ssh.assert_not_called()
+
     def test_get_history_refuses_a_nonsense_cursor_type(self):
         pane_id = "w0:p1"
         with loaded_relay() as relay:
