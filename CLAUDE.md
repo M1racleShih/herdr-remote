@@ -103,6 +103,8 @@ cd herdi-win && ./build.ps1
 | `HERDR_QUESTION_PROBE` | Set to `0` to stop reading idle panes for questions herdr's own detection missed |
 | `HERDR_QUESTION_PROBE_POLLS` | Poll ticks between full sweeps of the idle panes (default 5) |
 | `HERDR_CLAUDE_ROOTS` | Comma-separated roots to search for claude transcripts (default `~/.claude/projects`) |
+| `HERDR_CODEX_ROOTS` | Local Codex session roots (default `$CODEX_HOME/sessions`, or `~/.codex/sessions`) |
+| `HERDR_REMOTE_CODEX_ROOTS` | Remote Codex roots as shell words (default `$HOME/.codex/sessions`) |
 | `HERDR_PI_ROOTS` | Comma-separated roots holding pi session logs; a pane's path ref must sit inside one (default `~/.pi/agent/sessions`) |
 | `HERDR_REMOTE_CLAUDE_ROOTS` | Same, as remote shell words (default `$HOME/.claude/projects`) |
 | `HERDR_TRANSCRIPT_MAX_BYTES` / `HERDR_TRANSCRIPT_TAIL_BYTES` | Read only the last N bytes of a transcript past this size (default 64MB / 8MB) |
@@ -1054,8 +1056,14 @@ appeared for the people on a tunnel.
 
 ### Transcript reader (`relay/transcript.py`)
 
-Claude's JSONL is the only format understood; adding a harness is a locate+parse pair plus one line
-in `HARNESSES`. Live-measured on the 196 transcripts on this machine (327MB, largest file 33.4MB):
+Claude, Codex, Pi and Kimi JSONL are understood; adding a harness is a locate+parse pair plus one
+line in `HARNESSES`. Codex uses UUID refs to find dated or legacy flat `rollout-*.jsonl` files.
+Only its canonical `response_item` messages and tool calls/results are read: `event_msg` mirrors,
+reasoning, and developer/system context are dropped. Id-less items use a row hash for stable
+pagination cursors across tail reads. SSH reads currently have path shapes for Claude and Codex;
+other harnesses explicitly report `unsupported` remotely rather than probing Claude's tree.
+
+Claude measurements on the 196 transcripts on this machine (327MB, largest file 33.4MB):
 
 - **Found by uuid, not by deriving the path.** `glob(<root>/*/<uuid>.jsonl)` measured 0.7ms. The
   `cwd → directory` mangling rule is real (`/`, `.` and `_` all become `-`) but the pane's cwd is

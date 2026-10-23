@@ -59,6 +59,11 @@ also carries that host's transcripts to the client.
   own environment (`HERDR_CLAUDE_ROOTS`, `HERDR_REMOTE_CLAUDE_ROOTS`) and the uuid must match
   `^[0-9a-f]{8}-...-[0-9a-f]{12}$`. Clients send a `pane_id`, never a path or a session id, and the
   relay resolves it through state it built from `herdr pane list`.
+- Codex UUID refs locate `rollout-*.jsonl` files under the configured session roots
+  (`HERDR_CODEX_ROOTS`, default `$CODEX_HOME/sessions` or `~/.codex/sessions`).
+  Local symlinks cannot escape those roots. SSH reads use `HERDR_REMOTE_CODEX_ROOTS`
+  (default `$HOME/.codex/sessions`), with the same UUID and remote-root validation.
+  Reasoning and developer/system messages are not sent to clients.
 - Set `HERDR_TRANSCRIPT=0` to switch the whole capability off. `get_history` then answers
   `unavailable: "disabled"` and no transcript is opened, locally or remotely.
 

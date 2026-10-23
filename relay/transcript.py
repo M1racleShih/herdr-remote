@@ -8,7 +8,7 @@ does reach older rows -- a `recent` + text read, which walks the agent's own mou
 terminal. The agent writes its own transcript anyway, with real message boundaries and timestamps,
 so that is what we read.
 
-Claude, pi and kimi-code transcripts are all understood. Adding another harness means adding a
+Claude, Codex, pi and kimi-code transcripts are all understood. Adding another harness means adding a
 locate+parse pair, one line in HARNESSES (plus PATH_HARNESSES if it hands over a file path rather
 than an id) and, when its session ids are not bare uuids, one line in ID_VALUE_RES -- nothing else
 in here or in the relay is harness-specific.
@@ -16,6 +16,7 @@ in here or in the relay is harness-specific.
 import difflib
 from datetime import datetime, timezone
 import glob
+import hashlib
 import json
 import os
 import re
@@ -74,6 +75,8 @@ def _roots_env(name, default):
 
 ENABLED = os.environ.get("HERDR_TRANSCRIPT", "1").strip().lower() not in {"0", "false", "no", "off"}
 LOCAL_ROOTS = _roots_env("HERDR_CLAUDE_ROOTS", [os.path.expanduser("~/.claude/projects")])
+CODEX_ROOTS = _roots_env("HERDR_CODEX_ROOTS", [os.path.join(
+    os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"), "sessions")])
 # pi writes one JSONL per session under here; its session ref hands over the absolute path
 # (kind "path"), so these roots are a containment check rather than a search space.
 PI_ROOTS = _roots_env("HERDR_PI_ROOTS", [os.path.expanduser("~/.pi/agent/sessions")])
@@ -82,6 +85,7 @@ PI_ROOTS = _roots_env("HERDR_PI_ROOTS", [os.path.expanduser("~/.pi/agent/session
 KIMI_ROOTS = _roots_env("HERDR_KIMI_ROOTS", [os.path.expanduser("~/.kimi-code/sessions")])
 # Remote roots stay unexpanded: they are shell words for the remote host, whose $HOME is not ours.
 REMOTE_ROOTS = _roots_env("HERDR_REMOTE_CLAUDE_ROOTS", ["$HOME/.claude/projects"])
+REMOTE_CODEX_ROOTS = _roots_env("HERDR_REMOTE_CODEX_ROOTS", ["$HOME/.codex/sessions"])
 MAX_BYTES = _int_env("HERDR_TRANSCRIPT_MAX_BYTES", 64 * 1024 * 1024)
 TAIL_BYTES = _int_env("HERDR_TRANSCRIPT_TAIL_BYTES", 8 * 1024 * 1024)
 # Remote is stingier than local: the bytes cross a network, and the biggest transcript on this
@@ -437,6 +441,107 @@ def parse_claude(lines):
     return turns, title
 
 
+# ---------------------------------------------------------------------------- codex parser
+#
+# Codex rollouts carry both response_item and event_msg rows for the same conversation. Read
+# only the canonical response items: message text, function/custom tool calls and their results.
+# Session metadata, developer/system messages, reasoning and streaming events are not turns.
+
+
+def _codex_text(content):
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(block["text"] for block in content
+                     if isinstance(block, dict) and block.get("type") in ("input_text", "output_text")
+                     and isinstance(block.get("text"), str) and block["text"].strip())
+
+
+def _codex_tool_result(payload, tool_turns):
+    call_id = payload.get("call_id")
+    if not isinstance(call_id, str) or call_id not in tool_turns:
+        return
+    output = payload.get("output")
+    if isinstance(output, str):
+        try:
+            decoded = json.loads(output)
+        except ValueError:
+            decoded = None
+        # Older shell tools wrap the output and exit code in a JSON string.
+        if isinstance(decoded, dict) and isinstance(decoded.get("output"), str):
+            output = decoded
+    failed = False
+    if isinstance(output, dict):
+        metadata = output.get("metadata")
+        exit_code = metadata.get("exit_code") if isinstance(metadata, dict) else None
+        failed = isinstance(exit_code, int) and exit_code != 0
+        output = output.get("output")
+    if isinstance(output, list):
+        output = _codex_text(output)
+    _fold_tool_result({"tool_use_id": call_id, "content": output, "is_error": failed}, tool_turns)
+
+
+def parse_codex(lines):
+    """(turns, title) from a Codex rollout JSONL, without duplicating its event stream."""
+    turns, tool_turns, seen_rows = [], {}, set()
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue  # a live rollout can end with a partially written row
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        item_id = payload.get("id")
+        # Older rollouts have no item ids. Hash the row, not its index: a tail read or an append
+        # must not renumber existing pagination cursors. Replayed response items are deduped too.
+        key = item_id if isinstance(item_id, str) and item_id else hashlib.sha256(raw.encode()).hexdigest()
+        if key in seen_rows:
+            continue
+        seen_rows.add(key)
+        turn_row = {"uuid": key, "timestamp": row.get("timestamp")}
+        kind = payload.get("type")
+        if kind == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant") or payload.get("channel") == "analysis":
+                continue
+            text = _codex_text(payload.get("content"))
+            if text:
+                turns.append(_turn(turn_row, role, text, 0))
+        elif kind in ("function_call", "custom_tool_call"):
+            name = payload.get("name")
+            name = name if isinstance(name, str) and name else "tool"
+            args = _pi_tool_args(payload) if kind == "function_call" else {
+                "command": payload.get("input") if isinstance(payload.get("input"), str) else ""}
+            block = {"name": name, "input": args}
+            turn = _turn(turn_row, "tool", _tool_summary(block), 0, limit=TOOL_TEXT_LIMIT)
+            _annotate_tool(turn, block)
+            turns.append(turn)
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                tool_turns[call_id] = turn
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            _codex_tool_result(payload, tool_turns)
+    return turns, ""
+
+
+def locate_codex(session_value, roots=None):
+    """Find a dated (or older flat) rollout by validated session UUID, never by pane cwd."""
+    for root in (roots if roots is not None else CODEX_ROOTS):
+        root = os.path.realpath(os.path.expanduser(root))
+        for prefix in (os.path.join("*", "*", "*"), ""):
+            pattern = os.path.join(glob.escape(root), prefix, f"rollout-*-{session_value}.jsonl")
+            for path in sorted(glob.glob(pattern)):
+                real = os.path.realpath(path)
+                if os.path.commonpath([root, real]) == root and os.path.isfile(real):
+                    return real
+    return None
+
+
 # ---------------------------------------------------------------------------- pi parser
 #
 # pi's JSONL is an event stream: one row per `type`, and a conversation turn is a
@@ -708,7 +813,7 @@ def locate_claude(session_value, roots=None):
 REMOTE_ROOT_RE = re.compile(r"\A[A-Za-z0-9_./~$-]+\Z")
 
 
-def remote_probe_script(session_value, roots, expected_size, tail_bytes):
+def remote_probe_script(session_value, roots, expected_size, tail_bytes, harness="claude"):
     """A POSIX script that answers NOFILE / CACHED / SIZE+tail in one round trip.
 
     Only `ls`, `wc`, `tail` and `head` -- no python on the far side. `wc -c < file` is read through
@@ -721,7 +826,11 @@ def remote_probe_script(session_value, roots, expected_size, tail_bytes):
     safe_roots = [root for root in roots if REMOTE_ROOT_RE.match(root)]
     if not safe_roots:
         raise ValueError("no usable remote transcript root")
-    candidates = " ".join(f"{root}/*/{session_value}.jsonl" for root in safe_roots)
+    if harness not in {"claude", "codex"} or not UUID_RE.match(session_value):
+        raise ValueError("no usable remote transcript ref")
+    suffixes = (f"*/*/*/rollout-*-{session_value}.jsonl", f"rollout-*-{session_value}.jsonl") \
+        if harness == "codex" else (f"*/{session_value}.jsonl",)
+    candidates = " ".join(f"{root}/{suffix}" for root in safe_roots for suffix in suffixes)
     shortcut = (
         f'[ "$s" = "{int(expected_size)}" ] && {{ echo CACHED; exit 0; }}; '
         if expected_size > 0 else ""
@@ -860,9 +969,9 @@ def _unavailable(reason, agent=""):
 
 
 # Each harness is (locate, parse). PATH_HARNESSES also names the session-ref kind it accepts:
-# claude and kimi use "id" (a value we glob for), pi uses "path" (an absolute file it hands over).
-HARNESSES = {"claude": (locate_claude, parse_claude), "pi": (locate_pi, parse_pi),
-             "kimi": (locate_kimi, parse_kimi)}
+# claude, codex and kimi use "id" (a value we glob for), pi uses "path" (an absolute file it hands over).
+HARNESSES = {"claude": (locate_claude, parse_claude), "codex": (locate_codex, parse_codex),
+             "pi": (locate_pi, parse_pi), "kimi": (locate_kimi, parse_kimi)}
 PATH_HARNESSES = {"pi"}
 # The shape an "id" value must take, per harness. Anything absent defaults to a bare uuid, so an
 # unlisted harness keeps the tightest rule until somebody writes its reader.
@@ -908,6 +1017,9 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
             log.info("transcript: no reader for harness %r", harness)
         return _unavailable("unsupported", harness)
     locate, parse = entry
+    # Remote lookup needs a harness-specific path, not another harness's glob (or a raw path ref).
+    if remote and harness not in {"claude", "codex"}:
+        return _unavailable("unsupported", harness)
 
     try:
         limit = int(limit)
@@ -916,7 +1028,7 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
     limit = max(1, min(limit or DEFAULT_LIMIT, MAX_LIMIT))
     try:
         if remote:
-            parsed = _load_remote(value, parse, remote, ssh_args, remote_runner)
+            parsed = _load_remote(value, parse, remote, ssh_args, remote_runner, harness=harness)
         else:
             parsed = _load_local(value, locate, parse)
     except Exception:
@@ -956,11 +1068,12 @@ def _load_local(value, locate, parse):
     return parsed
 
 
-def _load_remote(value, parse, remote, ssh_args, remote_runner):
-    """Only the script's path shape is claude-specific; the parse comes from the harness table."""
-    key = (remote, value)
+def _load_remote(value, parse, remote, ssh_args, remote_runner, harness="claude"):
+    """Read the harness's own path shape, keeping its remote parse cache separate too."""
+    key = (remote, harness, value)
+    roots = REMOTE_CODEX_ROOTS if harness == "codex" else REMOTE_ROOTS
     runner = remote_runner or _default_remote_runner
-    script = remote_probe_script(value, REMOTE_ROOTS, cache_peek_size(key), REMOTE_TAIL_BYTES)
+    script = remote_probe_script(value, roots, cache_peek_size(key), REMOTE_TAIL_BYTES, harness=harness)
     returncode, blob = runner(remote, script, ssh_args)
     if returncode != 0:
         raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
@@ -973,7 +1086,7 @@ def _load_remote(value, parse, remote, ssh_args, remote_runner):
         if cached is not None:
             return cached
         # The cache was evicted between the probe and now. Ask again without the shortcut.
-        script = remote_probe_script(value, REMOTE_ROOTS, 0, REMOTE_TAIL_BYTES)
+        script = remote_probe_script(value, roots, 0, REMOTE_TAIL_BYTES, harness=harness)
         returncode, blob = runner(remote, script, ssh_args)
         if returncode != 0:
             raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
