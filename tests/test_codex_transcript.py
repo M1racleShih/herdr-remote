@@ -170,7 +170,10 @@ class CodexHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             path = write_rollout(second, [codex_message("user", "second root")])
             self.assertIsNone(transcript.locate_codex(SESSION, roots=[first]))
-            self.assertEqual(transcript.locate_codex(SESSION, roots=[first, second]), str(path))
+            # Compared through realpath: locate_codex resolves the file it found, and on macOS the
+            # temp dir sits under /var, which is a symlink to /private/var.
+            self.assertEqual(transcript.locate_codex(SESSION, roots=[first, second]),
+                             os.path.realpath(path))
 
     def test_symlinks_cannot_escape_a_codex_root(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
